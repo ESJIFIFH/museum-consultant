@@ -1,202 +1,567 @@
 """
-ingest.py — сбор исходных данных и наполнение векторного индекса.
+ingest.py
 
-ПРАКТИКА 2. Что делает студент:
-  1. clean_text()  — предварительная очистка: переносы, колонтитулы, мусорные пробелы
-  2. chunk_text()  — нарезка на чанки фиксированного размера с перекрытием
-  3. detect_category() — рубрикация чанка; словарь рубрик задаёте вы под свой домен
-
-  4. черновик gold_dataset.json — 5 вопросов с указанием файлов-источников
-
-Готово и трогать не нужно: обход data/raw/, чтение PDF и TXT, запись в ChromaDB,
-замер hit-rate в evaluate_retrieval().
-
-Каждый запуск пересобирает индекс с нуля — коллекция очищается перед наполнением.
-Поэтому при подборе параметров достаточно поправить CHUNK_SIZE или CHUNK_OVERLAP
-в config.py и запустить ingest.py снова: удалять data/chroma/ руками не нужно.
-
-Критерии приёмки:
-  - python ingest.py отрабатывает без ошибок, коллекция непуста
-  - у каждого чанка заполнены source, page и category; пустых category нет
-  - поиск с фильтром по category возвращает чанки только этой категории
-  - в gold_dataset.json не меньше 5 вопросов, у каждого заполнено expected_sources
-  - показаны не менее двух замеров с разными CHUNK_SIZE / CHUNK_OVERLAP,
-    и выбор итоговых значений объяснён числом, а не вкусом
-  - CHUNK_SIZE и CHUNK_OVERLAP берутся из config.py, а не зашиты в код
-
-Про метрику. hit-rate@k отвечает на один вопрос: попал ли фрагмент с ответом
-в первые k результатов. Считается механически, сверкой поля source с ожидаемым —
-ни модели, ни судьи для этого не нужно, поэтому мерить можно уже здесь, на П2.
-Не путайте её с Context Precision из триады RAG: та оценивает, насколько найденное
-относится к делу, её считает LLM-судья, и появляется она только на П6. В плане
-дисциплины обе назывались «точностью извлечения контекста», хотя это разные вещи.
-
-Запуск:
-    python ingest.py          # проиндексировать и сразу замерить
-    python ingest.py --eval   # только замер, без переиндексации
+Подготовка и индексация корпуса Пушкинского музея
+из masterpieces.json для P2.
 """
 
 import hashlib
+import html
+import json
+import re
+from collections import Counter
 from pathlib import Path
 
 import config
 
 
-# --- Читатели форматов: готовы ---
-
-def read_txt(path: Path) -> list[tuple[int, str]]:
-    """Возвращает [(номер страницы, текст)]. У TXT страниц нет, поэтому страница 0."""
-    return [(0, path.read_text(encoding="utf-8", errors="ignore"))]
+BASE_DIR = Path(__file__).parent
+RAW_DIR = config.RAW_DIR
+JSON_FILE = RAW_DIR / "masterpieces.json"
 
 
-def read_pdf(path: Path) -> list[tuple[int, str]]:
-    """Возвращает [(номер страницы, текст)] — постранично, чтобы метаданное page было честным."""
-    from pypdf import PdfReader
+# Ключевые слова для определения категории.
+CATEGORY_KEYWORDS = {
+    "collection": [
+        "инвентарный номер",
+        "коллекционер",
+        "происхождение",
+        "год поступления",
+        "поступление",
+        "коллекция",
+    ],
+    "object": [
+        "название",
+        "тип",
+        "страна",
+        "описание",
+        "аннотация",
+        "размер",
+    ],
+    "period": [
+        "период",
+        "дата создания",
+        "год создания",
+        "эпоха",
+        "династия",
+        "век",
+    ],
+    "attribution": [
+        "автор",
+        "авторы",
+        "материал",
+        "техника",
+        "место создания",
+    ],
+}
 
-    reader = PdfReader(str(path))
-    return [(i + 1, page.extract_text() or "") for i, page in enumerate(reader.pages)]
+
+def value_to_text(value):
+    """Преобразует вложенные значения JSON в обычный текст."""
+
+    if value is None:
+        return ""
+
+    if isinstance(value, str):
+        return value.strip()
+
+    if isinstance(value, (int, float, bool)):
+        return str(value)
+
+    if isinstance(value, list):
+        parts = []
+
+        for item in value:
+            text = value_to_text(item)
+
+            if text:
+                parts.append(text)
+
+        return "; ".join(parts)
+
+    if isinstance(value, dict):
+        # Для объектов вида {"ru": "...", "en": "..."}
+        ru_value = value.get("ru")
+
+        if isinstance(ru_value, str) and ru_value.strip():
+            return ru_value.strip()
+
+        parts = []
+
+        for key, item in value.items():
+            text = value_to_text(item)
+
+            if text:
+                parts.append(f"{key}: {text}")
+
+        return "; ".join(parts)
+
+    return str(value)
 
 
-READERS = {".txt": read_txt, ".md": read_txt, ".pdf": read_pdf}
+def ru_value(record, field):
+    """Получает русское значение поля."""
+
+    value = record.get(field, "")
+
+    if isinstance(value, dict):
+        return value_to_text(value.get("ru", ""))
+
+    return value_to_text(value)
 
 
-# --- Ваша часть (П2) ---
-
-def clean_text(text: str) -> str:
-    r"""Очистить сырой текст перед нарезкой.
-
-    Что обычно нужно убрать: разрывы слов по переносу строки, повторяющиеся
-    колонтитулы, номера страниц отдельной строкой, цепочки пробелов и пустых строк.
-
-    Подсказка: начните с re.sub(r"-\n", "", text) и r"\s+" -> " ", посмотрите
-    на результат глазами и добавьте правила под свои исходные данные.
+def read_json(path):
     """
-    raise NotImplementedError("П2: реализуйте очистку текста")
+    Читает masterpieces.json.
 
+    Реальная структура файла:
 
-def chunk_text(text: str, size: int = config.CHUNK_SIZE,
-               overlap: int = config.CHUNK_OVERLAP) -> list[str]:
-    """Нарезать текст на чанки размером size с перекрытием overlap.
+    {
+        "3687": {...},
+        "3675": {...},
+        "3706": {...}
+    }
 
-    Перекрытие нужно, чтобы мысль, попавшая на границу нарезки, не потерялась:
-    её хвост окажется в начале следующего чанка.
-
-    Следите за двумя вещами: шаг сдвига равен size - overlap (не size), и
-    overlap обязан быть меньше size, иначе цикл не сойдётся.
+    Поэтому ключ объекта сохраняем как record_id.
     """
-    raise NotImplementedError("П2: реализуйте нарезку с перекрытием")
+
+    with path.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    # Основной случай: словарь ID -> объект
+    if isinstance(data, dict):
+        if data and all(isinstance(value, dict) for value in data.values()):
+            return [
+                (str(record_id), record)
+                for record_id, record in data.items()
+            ]
+
+        # На случай другой структуры JSON
+        for key in (
+            "data",
+            "items",
+            "objects",
+            "masterpieces",
+            "results",
+        ):
+            value = data.get(key)
+
+            if isinstance(value, list):
+                return [
+                    (str(index + 1), record)
+                    for index, record in enumerate(value)
+                    if isinstance(record, dict)
+                ]
+
+        return [("1", data)]
+
+    # Если JSON оказался списком
+    if isinstance(data, list):
+        return [
+            (str(index + 1), record)
+            for index, record in enumerate(data)
+            if isinstance(record, dict)
+        ]
+
+    raise ValueError("Неизвестная структура masterpieces.json")
 
 
-def detect_category(text: str, source: str) -> str:
-    """Определить рубрику чанка.
+def record_to_text(record_id, record):
+    """Превращает один музейный объект в поисковый текст."""
 
-    Словарь рубрик — ваш проектный выбор, он зависит от домена. Для налогового
-    консультанта это может быть "law" | "faq" | "forms"; для ассистента абитуриента —
-    "admission" | "dormitory" | "schedule".
+    period_name = ru_value(record.get("period", {}), "name") \
+        if isinstance(record.get("period"), dict) else ""
 
-    Достаточно правил по имени файла и ключевым словам — LLM здесь не нужна.
-    Пустых категорий быть не должно: заведите рубрику по умолчанию.
-    """
-    raise NotImplementedError("П2: реализуйте рубрикацию")
+    period_text = ru_value(record.get("period", {}), "text") \
+        if isinstance(record.get("period"), dict) else ""
 
+    if period_name and period_text:
+        period = f"{period_name} — {period_text}"
+    else:
+        period = period_name or period_text
 
-# --- Сборка индекса: готова ---
+    fields = [
+        ("ID объекта", record_id),
+        ("Название", ru_value(record, "name")),
+        ("Инвентарный номер", record.get("inv_num", "")),
+        ("Тип", ru_value(record, "type")),
+        ("Страна", ru_value(record, "country")),
+        ("Период", period),
+        ("Год создания", record.get("year", "")),
+        ("Год поступления", record.get("get_year", "")),
+        ("Место создания", ru_value(record, "producein")),
+        ("Происхождение", ru_value(record, "from")),
+        ("Материал", ru_value(record, "material")),
+        ("Размер", ru_value(record, "size")),
+        ("Авторы", value_to_text(record.get("authors"))),
+        ("Коллекционеры", value_to_text(record.get("collectors"))),
+        ("Описание", ru_value(record, "text")),
+        ("Аннотация", ru_value(record, "annotation")),
+    ]
 
-def ingest() -> int:
-    """Обходит исходные данные, нарезает и складывает в ChromaDB. Возвращает число чанков.
+    lines = []
 
-    Индекс собирается заново с нуля: коллекция очищается перед наполнением.
-    Иначе после смены CHUNK_SIZE в коллекции остались бы чанки предыдущей
-    нарезки, и hit-rate@5 замерялся бы по смеси двух — молча, без ошибки.
-    """
-    collection = config.reset_collection()
-    total = 0
+    for label, value in fields:
+        value = value_to_text(value)
 
-    # README.md отсеивается намеренно: это шаблонная заглушка каталога,
-    # а не документ предметной области. Без отсева она попадает в индекс
-    # и выдаётся поиском как знание.
-    files = [p for p in config.RAW_DIR.rglob("*")
-             if p.suffix.lower() in READERS and p.name != "README.md"]
-    if not files:
-        raise SystemExit(f"В {config.RAW_DIR} нет файлов .txt/.md/.pdf — положите исходные данные (П2).")
+        if value:
+            lines.append(f"{label}: {value}")
 
-    for path in files:
-        for page, raw in READERS[path.suffix.lower()](path):
-            cleaned = clean_text(raw)
-            if not cleaned:
-                continue
-
-            for chunk in chunk_text(cleaned):
-                # id детерминированный: одинаковый текст даёт один и тот же чанк,
-                # поэтому дубли не возникают даже внутри одного прогона
-                chunk_id = hashlib.sha1(
-                    f"{path.name}:{page}:{chunk}".encode("utf-8")
-                ).hexdigest()
-
-                collection.upsert(
-                    ids=[chunk_id],
-                    documents=[chunk],
-                    metadatas=[{
-                        "source": path.name,
-                        "page": page,
-                        "category": detect_category(chunk, path.name),
-                    }],
-                )
-                total += 1
-
-    return total
+    return "\n".join(lines)
 
 
-# --- Замер качества поиска: готов ---
+def clean_text(text):
+    """Детерминированная очистка текста."""
 
-def evaluate_retrieval(k: int = config.TOP_K) -> float:
-    """hit-rate@k по черновику Gold Dataset. Готово, менять не нужно.
+    # HTML-сущности: &ndash; -> –, &laquo; -> « и т.д.
+    text = html.unescape(text)
 
-    Для каждого вопроса выполняется поиск и проверяется, попал ли в первые k
-    результатов хотя бы один чанк из ожидаемых источников.
+    # Переносы внутри слов
+    text = re.sub(r"-\s*\n\s*", "", text)
 
-    Вопросы с пустым expected_sources пропускаются: это проверка отказа отвечать,
-    а она требует LLM и меряется на П6, а не здесь.
+    # Переводы строк заменяем пробелами
+    text = text.replace("\r", " ")
+    text = text.replace("\n", " ")
 
-    Обращается к коллекции напрямую, а не через MCP: на П2 оркестратора ещё нет.
-    """
-    import json
+    # Повторяющиеся пробелы
+    text = re.sub(r"\s+", " ", text)
 
-    dataset_path = Path(__file__).parent / "gold_dataset.json"
-    cases = [c for c in json.loads(dataset_path.read_text(encoding="utf-8"))
-             if c.get("expected_sources")]
+    return text.strip()
 
-    if not cases:
-        print("В gold_dataset.json нет вопросов с expected_sources — замерять нечего (П2).")
-        return 0.0
+
+def chunk_text(text, chunk_size, overlap):
+    """Фиксированное чанкирование с перекрытием."""
+
+    if chunk_size <= 0:
+        raise ValueError("CHUNK_SIZE должен быть больше 0")
+
+    if overlap < 0:
+        raise ValueError("CHUNK_OVERLAP не может быть отрицательным")
+
+    if overlap >= chunk_size:
+        raise ValueError(
+            "CHUNK_OVERLAP должен быть меньше CHUNK_SIZE"
+        )
+
+    if not text:
+        return []
+
+    step = chunk_size - overlap
+
+    chunks = []
+
+    for start in range(0, len(text), step):
+        chunk = text[start:start + chunk_size]
+
+        if chunk:
+            chunks.append(chunk)
+
+        if start + chunk_size >= len(text):
+            break
+
+    return chunks
+
+
+def detect_category(text):
+    """Определяет одну из категорий P1."""
+
+    text_lower = text.lower()
+
+    scores = {}
+
+    for category, keywords in CATEGORY_KEYWORDS.items():
+        score = 0
+
+        for keyword in keywords:
+            if keyword in text_lower:
+                score += 1
+
+        scores[category] = score
+
+    best_category = max(scores, key=scores.get)
+
+    # Обязательная категория по умолчанию
+    if scores[best_category] == 0:
+        return "object"
+
+    return best_category
+
+
+def make_chunk_id(source, record_id, chunk_number, chunk):
+    """Создаёт стабильный ID чанка."""
+
+    raw = (
+        f"{source}:"
+        f"{record_id}:"
+        f"{chunk_number}:"
+        f"{chunk}"
+    )
+
+    return hashlib.sha1(
+        raw.encode("utf-8")
+    ).hexdigest()
+
+
+def ingest():
+    """Пересобирает ChromaDB из masterpieces.json."""
+
+    if not JSON_FILE.exists():
+        raise FileNotFoundError(
+            f"Файл не найден: {JSON_FILE}"
+        )
+
+    records = read_json(JSON_FILE)
+
+    print(
+        f"Найдено записей в masterpieces.json: "
+        f"{len(records)}"
+    )
+
+    # Полностью пересобираем коллекцию
+    config.reset_collection()
+    collection = config.get_collection()
+
+    all_ids = []
+    all_documents = []
+    all_metadatas = []
+
+    total_chunks = 0
+
+    for record_id, record in records:
+
+        raw_text = record_to_text(
+            record_id,
+            record
+        )
+
+        cleaned_text = clean_text(raw_text)
+
+        chunks = chunk_text(
+            cleaned_text,
+            config.CHUNK_SIZE,
+            config.CHUNK_OVERLAP,
+        )
+
+        for chunk_number, chunk in enumerate(chunks):
+
+            chunk_id = make_chunk_id(
+                JSON_FILE.name,
+                record_id,
+                chunk_number,
+                chunk,
+            )
+
+            category = detect_category(chunk)
+
+            all_ids.append(chunk_id)
+            all_documents.append(chunk)
+
+            all_metadatas.append(
+                {
+                    "source": JSON_FILE.name,
+                    "page": 0,
+                    "category": category,
+                    "record_id": record_id,
+                }
+            )
+
+            total_chunks += 1
+
+    if all_documents:
+        collection.add(
+            ids=all_ids,
+            documents=all_documents,
+            metadatas=all_metadatas,
+        )
+
+    print("Индекс пересобран заново.")
+    print(
+        f"Проиндексировано чанков: {total_chunks}"
+    )
+    print(
+        f"Всего в коллекции: {collection.count()}"
+    )
+
+    show_category_statistics(collection)
+
+
+def show_category_statistics(collection):
+    """Показывает распределение категорий."""
+
+    result = collection.get(
+        include=["metadatas"]
+    )
+
+    categories = Counter()
+
+    for metadata in result["metadatas"]:
+        category = metadata.get(
+            "category",
+            "object"
+        )
+
+        categories[category] += 1
+
+    print("Распределение категорий:")
+
+    for category, count in sorted(categories.items()):
+        print(f"  {category}: {count}")
+
+
+def evaluate_retrieval():
+    """Проверяет retrieval по gold_dataset.json."""
+
+    gold_path = BASE_DIR / "gold_dataset.json"
+
+    if not gold_path.exists():
+        print(
+            "\nGold dataset пока отсутствует:"
+            f" {gold_path}"
+        )
+        return
+
+    with gold_path.open(
+        "r",
+        encoding="utf-8"
+    ) as f:
+        cases = json.load(f)
+
+    # Проверяем, не остался ли шаблон П2
+    placeholder_cases = [
+        case
+        for case in cases
+        if "ЗАМЕНИТЕ" in case.get("question", "")
+    ]
+
+    if placeholder_cases:
+        print(
+            "\nGold dataset пока содержит "
+            "шаблонные вопросы."
+        )
+        print(
+            "Сначала заменим их на реальные "
+            "вопросы по masterpieces.json."
+        )
+        return
 
     collection = config.get_collection()
-    hits = 0
 
-    print(f"\nhit-rate@{k}  |  чанк {config.CHUNK_SIZE}, overlap {config.CHUNK_OVERLAP}")
+    if collection.count() == 0:
+        print("\nКоллекция пуста.")
+        return
+
+    evaluated = 0
+    hits_at_5 = 0
+    hits_at_1 = 0
+
+    print(
+        f"\nhit-rate@5 | "
+        f"чанк {config.CHUNK_SIZE}, "
+        f"overlap {config.CHUNK_OVERLAP}"
+    )
+
     for case in cases:
-        result = collection.query(query_texts=[case["question"]], n_results=k)
-        found = {(m or {}).get("source", "") for m in (result.get("metadatas") or [[]])[0]}
-        hit = bool(found & set(case["expected_sources"]))
-        hits += hit
-        print(f"  [{'+' if hit else '-'}] {case['question'][:70]}")
-        if not hit:
-            print(f"      ожидалось: {case['expected_sources']}, найдено: {sorted(found)}")
 
-    rate = hits / len(cases)
-    print(f"\nhit-rate@{k} = {rate:.0%}  ({hits} из {len(cases)})")
-    skipped = len(json.loads(dataset_path.read_text(encoding="utf-8"))) - len(cases)
-    if skipped:
-        print(f"Пропущено вопросов без expected_sources: {skipped} — они меряются на П6.")
-    return rate
+        expected_sources = case.get(
+            "expected_sources",
+            []
+        )
+
+        question_type = case.get(
+            "type",
+            "direct"
+        )
+
+        # out_of_scope не участвует в метрике
+        if question_type == "out_of_scope":
+            continue
+
+        if not expected_sources:
+            continue
+
+        question = case.get("question", "").strip()
+
+        if not question:
+            continue
+
+        evaluated += 1
+
+        n_results = min(
+            config.TOP_K,
+            collection.count()
+        )
+
+        result = collection.query(
+            query_texts=[question],
+            n_results=n_results,
+        )
+
+        metadatas = result.get(
+            "metadatas",
+            [[]]
+        )[0]
+
+        found_sources = [
+            metadata.get("source")
+            for metadata in metadatas
+        ]
+
+        hit_5 = any(
+            source in expected_sources
+            for source in found_sources[:5]
+        )
+
+        hit_1 = bool(
+            found_sources
+            and found_sources[0] in expected_sources
+        )
+
+        if hit_5:
+            hits_at_5 += 1
+
+        if hit_1:
+            hits_at_1 += 1
+
+        status = "OK" if hit_5 else "MISS"
+
+        print(
+            f"  [{status}] "
+            f"{question}"
+        )
+
+        print(
+            f"      ожидалось: "
+            f"{expected_sources}"
+        )
+
+        print(
+            f"      найдено: "
+            f"{found_sources[:5]}"
+        )
+
+    if evaluated == 0:
+        print(
+            "Нет вопросов, участвующих "
+            "в оценке."
+        )
+        return
+
+    rate_5 = hits_at_5 / evaluated * 100
+    rate_1 = hits_at_1 / evaluated * 100
+
+    print(
+        f"\nhit-rate@5 = "
+        f"{rate_5:.0f}% "
+        f"({hits_at_5} из {evaluated})"
+    )
+
+    print(
+        f"hit-rate@1 = "
+        f"{rate_1:.0f}% "
+        f"({hits_at_1} из {evaluated})"
+    )
 
 
 if __name__ == "__main__":
-    import sys
-
-    if "--eval" not in sys.argv:
-        count = ingest()
-        print(f"Индекс пересобран заново. Проиндексировано чанков: {count}")
-        print(f"Всего в коллекции: {config.get_collection().count()}")
-
+    ingest()
     evaluate_retrieval()

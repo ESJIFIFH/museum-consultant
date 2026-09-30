@@ -27,7 +27,7 @@ SECURITY_LOG = BASE_DIR / "security_logs.txt"
 # --- Параметры RAG (подбираются на П2) ---
 COLLECTION_NAME = "knowledge_base"
 EMBEDDING_MODEL = "intfloat/multilingual-e5-small"
-CHUNK_SIZE = 512      # символов в чанке
+CHUNK_SIZE = 512     # символов в чанке
 CHUNK_OVERLAP = 64    # перекрытие между соседними чанками
 TOP_K = 5             # сколько чанков возвращает поиск
 

@@ -5,6 +5,7 @@
 data/chroma/
 data/raw/*
 !data/raw/README.md
+!data/raw/masterpieces.json
 *.db
 security_logs.txt
 

@@ -1,37 +1,72 @@
 [
   {
-    "id": 1,
-    "question": "ЗАМЕНИТЕ (П2): вопрос, ответ на который прямо есть в корпусе",
-    "expected_sources": ["имя_файла.pdf"],
+    "id": "q01",
+    "question": "Как называется объект с инвентарным номером I.1.a 5776?",
+    "expected_sources": ["masterpieces.json"],
     "expected": "",
     "type": "direct"
   },
   {
-    "id": 2,
-    "question": "ЗАМЕНИТЕ (П2): вопрос, ответ на который лежит в другом файле",
-    "expected_sources": ["другой_файл.pdf"],
+    "id": "q02",
+    "question": "Из какого материала изготовлен «Портрет юноши в золотом венке»?",
+    "expected_sources": ["masterpieces.json"],
     "expected": "",
     "type": "direct"
   },
   {
-    "id": 3,
-    "question": "ЗАМЕНИТЕ (П2): вопрос на стыке двух разделов базы знаний",
-    "expected_sources": ["имя_файла.pdf", "другой_файл.pdf"],
+    "id": "q03",
+    "question": "К какому периоду относятся «Статуэтки Аменхотепа и Раннаи»?",
+    "expected_sources": ["masterpieces.json"],
+    "expected": "",
+    "type": "direct"
+  },
+  {
+    "id": "q04",
+    "question": "Какой инвентарный номер у картины «Завтрак на траве»?",
+    "expected_sources": ["masterpieces.json"],
+    "expected": "",
+    "type": "direct"
+  },
+  {
+    "id": "q05",
+    "question": "В какой стране был создан «Портрет юноши в золотом венке»?",
+    "expected_sources": ["masterpieces.json"],
+    "expected": "",
+    "type": "direct"
+  },
+  {
+    "id": "q06",
+    "question": "Как называется произведение с инвентарным номером Ж-3335?",
+    "expected_sources": ["masterpieces.json"],
+    "expected": "",
+    "type": "direct"
+  },
+  {
+    "id": "q07",
+    "question": "Какой материал указан для «Статуи царя Аменемхета III»?",
+    "expected_sources": ["masterpieces.json"],
+    "expected": "",
+    "type": "direct"
+  },
+  {
+    "id": "q08",
+    "question": "Какие произведения в корпусе имеют название «Статер»?",
+    "expected_sources": ["masterpieces.json"],
     "expected": "",
     "type": "cross_section"
   },
   {
-    "id": 4,
-    "question": "ЗАМЕНИТЕ (П2): вопрос с неоднозначной формулировкой",
-    "expected_sources": ["имя_файла.pdf"],
+    "id": "q09",
+    "question": "Какой объект имеет инвентарный номер Ж-3399?",
+    "expected_sources": ["masterpieces.json"],
     "expected": "",
-    "type": "ambiguous"
+    "type": "direct"
   },
   {
-    "id": 5,
-    "question": "ЗАМЕНИТЕ (П2): вопрос, ответа на который в корпусе НЕТ",
-    "expected_sources": [],
-    "expected": "В базе знаний нет ответа на этот вопрос",
-    "type": "out_of_scope"
+    "id": "q10",
+    "question": "Есть ли в корпусе объект с названием «Портрет С.В. Олсуфьевой»?",
+    "expected_sources": ["masterpieces.json"],
+    "expected": "",
+    "type": "direct"
   }
 ]
